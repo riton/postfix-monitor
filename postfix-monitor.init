@@ -1,0 +1,49 @@
+#!/bin/sh -e
+
+### BEGIN INIT INFO
+# Provides:		postfix-monitor
+# Required-Start:	$local_fs
+# Required-Stop:	$local_fs
+# Should-Start:		$network $syslog
+# Should-Stop:		$network $syslog
+# Default-Start:	2 3 4 5
+# Default-Stop:		0 1 6
+# Short-Description:	Postfix Monitoring daemon
+# Description:		Postfix Monitoring daemon
+### END INIT INFO
+
+# Postfix Monitor daemon
+# v1.0 - R.F - 20110307
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin
+PERL_BIN="/usr/bin/perl"
+PID_FILE="/var/run/postfix-monitor/postfix-monitor.pid"
+DAEMON_BIN="/usr/sbin/postfix-monitor"
+DAEMON_NAME="postfix-monitor"
+DAEMON_ARGS="-d"
+
+##
+##
+
+case $1 in
+start)
+	start-stop-daemon --verbose --start --exec "${DAEMON_BIN}" --chuid postfix --chdir "/" -- ${DAEMON_ARGS}
+	;;
+
+stop)
+	#start-stop-daemon --stop --pidfile "${PID_FILE}" --user postfix --retry 2
+	pkill ${DAEMON_NAME}
+	;;
+
+restart)
+	$0 stop
+	sleep 1
+	$0 start
+	;;
+
+*)
+	echo "Usage: $0 start|stop" >&2
+	exit 1
+	;;
+esac
+

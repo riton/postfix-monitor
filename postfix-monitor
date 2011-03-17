@@ -1,0 +1,231 @@
+#!/usr/bin/perl -w
+
+use strict;
+use warnings;
+use Data::Dumper;
+use Sys::Syslog qw(:standard :macros);
+use IO::Select;
+use Getopt::Std;
+use BerkeleyDB;
+use Sys::Hostname;
+use Proc::Daemon;
+use vars qw($lock $db %hash);
+
+############
+## CONFIG ##
+############
+# FiFo used to retrieve Postfix log (syslog ?)
+my $postfix_log_device = "/var/lib/postfix-monitor/postfix-logs";
+
+# Where to save Berkeley DB used for stats
+my $bdb_root = "/var/lib/postfix-monitor";
+
+# Berkeley DB file name
+my $bdb_name = "postfix_stats.bdb";
+
+# Debug level
+my $do_debug = 0;
+
+###########
+## Usage ##
+###########
+my $prgname = "postfix-monitor";
+
+sub Usage {
+	print STDERR <<EOUSAGE
+$prgname [-rd]
+-r:\tRead-Only mode
+-d:\tDaemonize process
+EOUSAGE
+;
+	exit(1);
+}
+
+##########
+## MAIN ##
+##########
+my %opt = ();
+
+init_syslog();
+
+getopts("rd", \%opt) or Usage();
+
+# Set-up umask()
+umask(0113);
+
+notify("$prgname starting up");
+
+# Daemon ?
+if ($opt{d}) {
+	daemonize();
+	run();
+	die("Unexpected exit() occurs");
+}
+
+# Consult
+if ($opt{r}) {
+	fatal("Unable to find readable Bdb at '$bdb_root/$bdb_name'") unless (-r "$bdb_root/$bdb_name");
+} else {
+	fatal("Unable to find writable Bdb at '$bdb_root/$bdb_name'") unless (-w "$bdb_root/$bdb_name");
+}
+
+my $db = init_bdb(1);
+	
+my $now = time();
+for my $mail_status (qw/deferred sent local user-unknown rejected/) {
+	$db->db_sync();
+	my $value;
+	{
+		my $lock = $db->cds_lock();
+		debug("DB locked");
+		my $db_value = $hash{$mail_status};
+		$value = defined($db_value) ? $db_value : 0;
+		$hash{$mail_status} = 0 unless ($opt{r});
+	}
+	print "$mail_status:$value ";
+}
+print "\n";
+
+exit(0);
+
+#############
+## HELPERS ##
+#############
+sub daemonize {
+
+	Proc::Daemon::Init({
+		work_dir => "/",
+		pid_file => "/var/run/postfix-monitor/postfix-monitor.pid",
+	});
+
+	$SIG{HUP} = sub { $do_debug = ($do_debug == 0) ? 1 : 0; };
+}
+
+sub init_bdb {
+
+	my $do_create = shift();
+	my $flags_env = DB_INIT_CDB | DB_INIT_MPOOL;
+	my $flags = 0;
+
+	$flags |= DB_CREATE if ($do_create);
+	$flags_env |= DB_CREATE if ($do_create);
+
+	my $bdb_env = BerkeleyDB::Env->new(
+		-Home   => "$bdb_root",
+		-Flags  => $flags_env)
+	or fatal("Unable to open BDB environment: $BerkeleyDB::Error");
+
+	my $db = tie(%hash, 'BerkeleyDB::Hash',
+			-Filename => "$bdb_root/$bdb_name",
+			-Env => $bdb_env,
+			-Flags => $flags) or fatal("Unable to open BDB at '$bdb_root/$bdb_name': $BerkeleyDB::Error");
+
+	return $db;
+}
+
+sub run {
+
+	fatal("Unable to find '$postfix_log_device'") unless (-r $postfix_log_device);
+	fatal("Unable to write into '$bdb_root'") unless (-w $bdb_root);
+
+	my $db = init_bdb(1);
+
+	my $log;
+	my $continue = 1;
+	until ($continue == 0) {
+		open($log, "<", $postfix_log_device) or fatal("Unable to open postfix log device at '$postfix_log_device': $!");
+
+		$log->autoflush(1);
+
+		notify("Postfix device opened, waiting for log event");
+		
+		while (my $line = <$log>) {
+			chomp($line);
+			debug("Received: line: $line");
+			my $h = parse_syslog_line($line);
+			next if (keys(%$h) == 0);
+			my $key;
+			map { $key = $_ } keys(%$h);
+			notify("Identified a '$key' message");
+			$db->db_sync();
+			debug("DB sync");
+			{
+				my $lock = $db->cds_lock();
+				debug("DB locked");
+				$hash{$key}++;
+			}
+			debug("DB unlocked");
+			debug("DB updated");
+			$db->db_sync();
+			debug("DB sync");
+		}
+
+		notify("Postfix device closed");
+		close($log);
+	}
+}
+
+#############
+## HELPERS ##
+#############
+sub init_syslog {
+	openlog("postfix-monitor", "cons,pid", "daemon");
+}
+
+sub _Log {
+	my $pr = shift;
+	syslog $pr, join(" ", @_);
+	return;
+}
+
+sub notify {
+	return _Log(LOG_NOTICE, @_);
+}
+
+sub debug {
+	return _Log(LOG_NOTICE, @_) if ($do_debug); 
+}
+
+sub err {
+	return _Log(LOG_ERR, @_);
+}
+
+sub fatal {
+	_Log(LOG_ERR, @_);
+	exit(1);
+}
+
+sub parse_syslog_line {
+
+	my $line = shift;
+
+	unless ($line =~ /r1t0n postfix\/(\w+).*?: (.*)/) {
+		return {};
+	}
+
+	my ($subprg, $message) = ($1, $2);
+
+	debug("SubPrgr: $subprg");
+
+	return {} if ($subprg eq "anvil");
+
+	if ($subprg eq "smtpd") {
+		if ($message =~ /NOQUEUE: reject:/) {
+			if ($message =~ /Recipient address rejected: User unknown in local recipient table/) {
+				return {"user-unknown" => 1};
+			}
+			return {rejected => 1};
+		}
+	}
+	elsif ($subprg eq "smtp") {
+		return {deferred => 1} if ($message =~ /status=deferred/);
+		return {sent => 1} if ($message =~ /status=sent/);
+	}
+	elsif ($subprg eq "local") {
+		return {"local" => 1} if ($message =~ /status=sent/);
+	}
+
+	debug("Useless message: $message($subprg)");
+	return {};
+}
+
